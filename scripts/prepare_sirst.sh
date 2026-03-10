@@ -79,8 +79,10 @@ echo "[3/4] Building YOLO labels and split folders..."
 SIRST_ROOT="$WORK_DIR/sirst_root" RAW_ROOT="$WORK_DIR/raw" SPLIT_DIR="$SPLIT_DIR" OUT_DIR="$OUT_DIR" python - <<'PY'
 import os
 import shutil
-import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import numpy as np
+from PIL import Image
 
 
 def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
@@ -122,37 +124,31 @@ for split in ("train", "val", "test"):
         dst_img = out_dir / "images" / split / src_img.name
         shutil.copy2(src_img, dst_img)
 
-        xml_path = masks_root / f"{stem}.xml"
-        if not xml_path.exists():
-            raise SystemExit(f"Missing annotation xml for {stem}: {xml_path}")
-
-        root = ET.parse(xml_path).getroot()
-        size = root.find("size")
-        if size is None:
-            raise SystemExit(f"Annotation missing <size>: {xml_path}")
-        w = float(size.findtext("width", "0"))
-        h = float(size.findtext("height", "0"))
+        with Image.open(src_img) as image:
+            w, h = image.size
         if w <= 0 or h <= 0:
-            raise SystemExit(f"Invalid size in {xml_path}")
+            raise SystemExit(f"Invalid image size for {src_img}")
+
+        mask_path = masks_root / f"{stem}_pixels0.png"
+        if not mask_path.exists():
+            raise SystemExit(f"Missing mask png for {stem}: {mask_path}")
 
         lines = []
-        for obj in root.findall("object"):
-            bnd = obj.find("bndbox")
-            if bnd is None:
-                continue
-            xmin = float(bnd.findtext("xmin", "0"))
-            ymin = float(bnd.findtext("ymin", "0"))
-            xmax = float(bnd.findtext("xmax", "0"))
-            ymax = float(bnd.findtext("ymax", "0"))
+        mask = np.array(Image.open(mask_path).convert("L")) > 0
+        ys, xs = np.where(mask)
+        if len(xs):
+            # Keep one detection per image by enclosing all positive pixels.
+            x0 = float(xs.min())
+            y0 = float(ys.min())
+            x1 = float(xs.max() + 1)
+            y1 = float(ys.max() + 1)
 
-            # Convert VOC box to normalized YOLO xywh.
-            x_center = clamp(((xmin + xmax) / 2.0) / w)
-            y_center = clamp(((ymin + ymax) / 2.0) / h)
-            bw = clamp((xmax - xmin) / w)
-            bh = clamp((ymax - ymin) / h)
-            if bw <= 0.0 or bh <= 0.0:
-                continue
-            lines.append(f"0 {x_center:.8f} {y_center:.8f} {bw:.8f} {bh:.8f}")
+            x_center = clamp(((x0 + x1) / 2.0) / w)
+            y_center = clamp(((y0 + y1) / 2.0) / h)
+            bw = clamp((x1 - x0) / w)
+            bh = clamp((y1 - y0) / h)
+            if bw > 0.0 and bh > 0.0:
+                lines.append(f"0 {x_center:.8f} {y_center:.8f} {bw:.8f} {bh:.8f}")
 
         (out_dir / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
 
