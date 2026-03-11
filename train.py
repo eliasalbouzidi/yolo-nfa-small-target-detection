@@ -412,19 +412,20 @@ def train(hyp, opt, device, tb_writer=None):
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                results, maps, times = test.test(data_dict,
-                                                 batch_size=batch_size * 2,
-                                                 imgsz=imgsz_test,
-                                                 model=ema.ema,
-                                                 single_cls=opt.single_cls,
-                                                 dataloader=testloader,
-                                                 save_dir=save_dir,
-                                                 verbose=nc < 50 and final_epoch,
-                                                 plots=plots and final_epoch,
-                                                 wandb_logger=wandb_logger,
-                                                 compute_loss=compute_loss,
-                                                 is_coco=is_coco,
-                                                 v5_metric=opt.v5_metric)
+                results, maps, times, extra_metrics = test.test(data_dict,
+                                                                 batch_size=batch_size * 2,
+                                                                 imgsz=imgsz_test,
+                                                                 model=ema.ema,
+                                                                 single_cls=opt.single_cls,
+                                                                 dataloader=testloader,
+                                                                 save_dir=save_dir,
+                                                                 verbose=nc < 50 and final_epoch,
+                                                                 plots=plots and final_epoch,
+                                                                 wandb_logger=wandb_logger,
+                                                                 compute_loss=compute_loss,
+                                                                 is_coco=is_coco,
+                                                                 v5_metric=opt.v5_metric,
+                                                                 return_extra_metrics=True)
 
             # Write
             with open(results_file, 'a') as f:
@@ -436,9 +437,30 @@ def train(hyp, opt, device, tb_writer=None):
             f1 = 2 * results[0] * results[1] / (results[0] + results[1] + 1e-16)
             tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
                     'metrics/precision', 'metrics/recall', 'metrics/F1', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
+                    'metrics/top1_iou50_precision', 'metrics/top1_iou50_recall', 'metrics/top1_iou50_F1',
+                    'metrics/top1_iou25_precision', 'metrics/top1_iou25_recall', 'metrics/top1_iou25_F1',
+                    'metrics/top1_center_in_gt_precision', 'metrics/top1_center_in_gt_recall',
+                    'metrics/top1_center_in_gt_F1',
                     'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
                     'x/lr0', 'x/lr1', 'x/lr2']  # params
-            for x, tag in zip(list(mloss[:-1]) + [results[0], results[1], f1, *results[2:]] + lr, tags):
+            metrics_values = [
+                results[0],
+                results[1],
+                f1,
+                results[2],
+                results[3],
+                extra_metrics['top1_iou50_precision'],
+                extra_metrics['top1_iou50_recall'],
+                extra_metrics['top1_iou50_F1'],
+                extra_metrics['top1_iou25_precision'],
+                extra_metrics['top1_iou25_recall'],
+                extra_metrics['top1_iou25_F1'],
+                extra_metrics['top1_center_in_gt_precision'],
+                extra_metrics['top1_center_in_gt_recall'],
+                extra_metrics['top1_center_in_gt_F1'],
+                *results[4:],
+            ]
+            for x, tag in zip(list(mloss[:-1]) + metrics_values + lr, tags):
                 if tb_writer:
                     tb_writer.add_scalar(tag, x, epoch)  # tensorboard
                 if wandb_logger.wandb:

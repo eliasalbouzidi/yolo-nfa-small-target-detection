@@ -13,7 +13,7 @@ from models.experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
     box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
-from utils.metrics import ap_per_class, ConfusionMatrix
+from utils.metrics import ap_per_class, box_center_in_box, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
 
@@ -40,7 +40,8 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         return_extra_metrics=False):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -100,7 +101,7 @@ def test(data,
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
+    jdict, stats, top1_iou50_stats, top1_iou25_stats, top1_center_stats, ap, ap_class, wandb_images = [], [], [], [], [], [], [], []
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
@@ -133,9 +134,18 @@ def test(data,
             path = Path(paths[si])
             seen += 1
 
+            tcls_tensor = labels[:, 0] if nl else torch.empty(0, device=device)
+            tbox = labels.new_zeros((0, 4))
+            if nl:
+                tbox = xywh2xyxy(labels[:, 1:5])
+                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
+
             if len(pred) == 0:
                 if nl:
                     stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                top1_iou50_stats.append((torch.zeros(0, 1, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                top1_iou25_stats.append((torch.zeros(0, 1, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                top1_center_stats.append((torch.zeros(0, 1, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                 continue
 
             # Predictions
@@ -175,15 +185,28 @@ def test(data,
                                   'bbox': [round(x, 3) for x in b],
                                   'score': round(p[4], 5)})
 
+            top1_idx = pred[:, 4].argmax()
+            top1_pred = pred[top1_idx:top1_idx + 1]
+            top1_predn = predn[top1_idx:top1_idx + 1]
+            top1_iou50_correct = torch.zeros(1, 1, dtype=torch.bool, device=device)
+            top1_iou25_correct = torch.zeros(1, 1, dtype=torch.bool, device=device)
+            top1_center_correct = torch.zeros(1, 1, dtype=torch.bool, device=device)
+            if nl:
+                same_cls = top1_pred[:, 5:6] == tcls_tensor.view(1, -1)
+                if same_cls.any():
+                    top1_ious = box_iou(top1_predn[:, :4], tbox)
+                    top1_iou50_correct[0, 0] = (same_cls & (top1_ious >= 0.50)).any()
+                    top1_iou25_correct[0, 0] = (same_cls & (top1_ious >= 0.25)).any()
+                    center_hits = box_center_in_box(top1_predn[:, :4], tbox)
+                    top1_center_correct[0, 0] = (same_cls & center_hits).any()
+            top1_iou50_stats.append((top1_iou50_correct.cpu(), top1_pred[:, 4].cpu(), top1_pred[:, 5].cpu(), tcls))
+            top1_iou25_stats.append((top1_iou25_correct.cpu(), top1_pred[:, 4].cpu(), top1_pred[:, 5].cpu(), tcls))
+            top1_center_stats.append((top1_center_correct.cpu(), top1_pred[:, 4].cpu(), top1_pred[:, 5].cpu(), tcls))
+
             # Assign all predictions as incorrect
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
             if nl:
                 detected = []  # target indices
-                tcls_tensor = labels[:, 0]
-
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5])
-                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
                 if plots:
                     confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
 
@@ -228,9 +251,87 @@ def test(data,
     else:
         nt = torch.zeros(1)
 
+    extra_metrics = {
+        'top1_iou50_precision': 0.0,
+        'top1_iou50_recall': 0.0,
+        'top1_iou50_F1': 0.0,
+        'top1_iou25_precision': 0.0,
+        'top1_iou25_recall': 0.0,
+        'top1_iou25_F1': 0.0,
+        'top1_center_in_gt_precision': 0.0,
+        'top1_center_in_gt_recall': 0.0,
+        'top1_center_in_gt_F1': 0.0,
+    }
+    top1_iou50_stats = [np.concatenate(x, 0) for x in zip(*top1_iou50_stats)]
+    if len(top1_iou50_stats) and top1_iou50_stats[0].any():
+        top1_p, top1_r, _, top1_f1, _ = ap_per_class(
+            *top1_iou50_stats,
+            plot=False,
+            v5_metric=v5_metric,
+            save_dir=save_dir,
+            names=names,
+        )
+        extra_metrics.update({
+            'top1_iou50_precision': float(top1_p.mean()),
+            'top1_iou50_recall': float(top1_r.mean()),
+            'top1_iou50_F1': float(top1_f1.mean()),
+        })
+    top1_iou25_stats = [np.concatenate(x, 0) for x in zip(*top1_iou25_stats)]
+    if len(top1_iou25_stats) and top1_iou25_stats[0].any():
+        top1_p, top1_r, _, top1_f1, _ = ap_per_class(
+            *top1_iou25_stats,
+            plot=False,
+            v5_metric=v5_metric,
+            save_dir=save_dir,
+            names=names,
+        )
+        extra_metrics.update({
+            'top1_iou25_precision': float(top1_p.mean()),
+            'top1_iou25_recall': float(top1_r.mean()),
+            'top1_iou25_F1': float(top1_f1.mean()),
+        })
+    top1_center_stats = [np.concatenate(x, 0) for x in zip(*top1_center_stats)]
+    if len(top1_center_stats) and top1_center_stats[0].any():
+        top1_p, top1_r, _, top1_f1, _ = ap_per_class(
+            *top1_center_stats,
+            plot=False,
+            v5_metric=v5_metric,
+            save_dir=save_dir,
+            names=names,
+        )
+        extra_metrics.update({
+            'top1_center_in_gt_precision': float(top1_p.mean()),
+            'top1_center_in_gt_recall': float(top1_r.mean()),
+            'top1_center_in_gt_F1': float(top1_f1.mean()),
+        })
+
     # Print results
     pf = '%20s' + '%12i' * 2 + '%12.3g' * 4  # print format
     print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+    print(
+        '%20s%12.3g%12.3g%12.3g' % (
+            'top1_iou50',
+            extra_metrics['top1_iou50_precision'],
+            extra_metrics['top1_iou50_recall'],
+            extra_metrics['top1_iou50_F1'],
+        )
+    )
+    print(
+        '%20s%12.3g%12.3g%12.3g' % (
+            'top1_iou25',
+            extra_metrics['top1_iou25_precision'],
+            extra_metrics['top1_iou25_recall'],
+            extra_metrics['top1_iou25_F1'],
+        )
+    )
+    print(
+        '%20s%12.3g%12.3g%12.3g' % (
+            'top1_center_in_gt',
+            extra_metrics['top1_center_in_gt_precision'],
+            extra_metrics['top1_center_in_gt_recall'],
+            extra_metrics['top1_center_in_gt_F1'],
+        )
+    )
 
     # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
@@ -284,7 +385,10 @@ def test(data,
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    results = (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist())
+    if return_extra_metrics:
+        return results, maps, t, extra_metrics
+    return results, maps, t
 
 
 if __name__ == '__main__':

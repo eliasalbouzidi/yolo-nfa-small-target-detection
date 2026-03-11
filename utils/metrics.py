@@ -110,6 +110,16 @@ def compute_ap(recall, precision, v5_metric=False):
     return ap, mpre, mrec
 
 
+def box_center_in_box(boxes1, boxes2):
+    """Return True where the center of boxes1 lies inside boxes2."""
+    centers_x = (boxes1[:, 0] + boxes1[:, 2]) / 2
+    centers_y = (boxes1[:, 1] + boxes1[:, 3]) / 2
+    return ((centers_x[:, None] >= boxes2[:, 0]) &
+            (centers_x[:, None] <= boxes2[:, 2]) &
+            (centers_y[:, None] >= boxes2[:, 1]) &
+            (centers_y[:, None] <= boxes2[:, 3]))
+
+
 class ConfusionMatrix:
     # Updated version of https://github.com/kaanakan/object_detection_confusion_matrix
     def __init__(self, nc, conf=0.25, iou_thres=0.45):
