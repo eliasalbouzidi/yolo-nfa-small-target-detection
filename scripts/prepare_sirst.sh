@@ -38,16 +38,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! -f "$ZIP_PATH" ]]; then
-  echo "Missing zip file: $ZIP_PATH" >&2
-  exit 1
-fi
-
-if [[ -d "$OUT_DIR" && "$FORCE" -ne 1 ]]; then
-  echo "Output directory already exists: $OUT_DIR" >&2
-  echo "Use --force to overwrite." >&2
-  exit 1
-fi
+[[ -f "$ZIP_PATH" ]] || exit 1
+[[ ! -d "$OUT_DIR" || "$FORCE" -eq 1 ]] || exit 1
 
 if [[ "$FORCE" -eq 1 ]]; then
   rm -rf "$OUT_DIR"

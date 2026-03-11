@@ -1,0 +1,8 @@
+# SIRST-V2 dataset prepared with scripts/prepare_sirst_v2.sh
+
+train: ./datasets/sirst-v2/images/train
+val: ./datasets/sirst-v2/images/val
+test: ./datasets/sirst-v2/images/test
+
+nc: 1
+names: ['target']
