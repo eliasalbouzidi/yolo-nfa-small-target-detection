@@ -10,12 +10,13 @@ from . import general
 
 
 def fitness(x):
-    # Model fitness as a weighted combination of metrics
-    w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
-    return (x[:, :4] * w).sum(1)
+    # Model fitness as a weighted combination of [F1@0.05, AP@0.05, Prec@0.05, Rec@0.05, FA/image]
+    w = [0.5, 0.5, 0.0, 0.0, 0.0]
+    return (x[:, :5] * w).sum(1)
 
 
-def ap_per_class(tp, conf, pred_cls, target_cls, v5_metric=False, plot=False, save_dir='.', names=()):
+def ap_per_class(tp, conf, pred_cls, target_cls, v5_metric=False, plot=False, save_dir='.', names=(),
+                 return_threshold=False):
     """ Compute the average precision, given the recall and precision curves.
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
     # Arguments
@@ -75,6 +76,8 @@ def ap_per_class(tp, conf, pred_cls, target_cls, v5_metric=False, plot=False, sa
         plot_mc_curve(px, r, Path(save_dir) / 'R_curve.png', names, ylabel='Recall')
 
     i = f1.mean(0).argmax()  # max F1 index
+    if return_threshold:
+        return p[:, i], r[:, i], ap, f1[:, i], unique_classes.astype('int32'), float(px[i])
     return p[:, i], r[:, i], ap, f1[:, i], unique_classes.astype('int32')
 
 

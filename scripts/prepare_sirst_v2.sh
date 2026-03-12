@@ -155,11 +155,12 @@ with zipfile.ZipFile(zip_path) as archive:
                 xmax = float(box.findtext("xmax", default="0"))
                 ymax = float(box.findtext("ymax", default="0"))
 
-                # SIRST-V2 boxes behave like inclusive pixel bounds.
-                x0 = xmin
-                y0 = ymin
-                x1 = xmax + 1.0
-                y1 = ymax + 1.0
+                # SIRST-V2 XML stores 1-based, half-open bounds that line up
+                # with the connected components in the original SIRST masks.
+                x0 = xmin - 1.0
+                y0 = ymin - 1.0
+                x1 = xmax - 1.0
+                y1 = ymax - 1.0
 
                 bw = clamp((x1 - x0) / width)
                 bh = clamp((y1 - y0) / height)

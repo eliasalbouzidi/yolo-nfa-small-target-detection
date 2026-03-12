@@ -38,6 +38,10 @@ from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 logger = logging.getLogger(__name__)
 
 
+def resolve_model_cfg(cfg):
+    return cfg
+
+
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     save_dir, epochs, batch_size, total_batch_size, weights, rank = \
@@ -85,14 +89,16 @@ def train(hyp, opt, device, tb_writer=None):
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model_cfg = resolve_model_cfg(opt.cfg or ckpt['model'].yaml)
+        model = Model(model_cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model_cfg = resolve_model_cfg(opt.cfg)
+        model = Model(model_cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -294,7 +300,7 @@ def train(hyp, opt, device, tb_writer=None):
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    results = (0, 0, 0, 0, 0, 0, 0, 0)  # F1@0.05, AP@0.05, Prec@0.05, Rec@0.05, FA/image, val losses
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossAuxOTA(model)  # init loss class
@@ -426,45 +432,25 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Write
             with open(results_file, 'a') as f:
-                f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
+                f.write(s + '%10.4g' * 8 % results + '\n')  # append metrics, val_loss
             if len(opt.name) and opt.bucket:
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
 
             # Log
-            f1 = 2 * results[0] * results[1] / (results[0] + results[1] + 1e-16)
             tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
-                    'metrics/precision', 'metrics/recall', 'metrics/F1', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                    'metrics/top1_iou50_precision', 'metrics/top1_iou50_recall', 'metrics/top1_iou50_F1',
-                    'metrics/top1_iou25_precision', 'metrics/top1_iou25_recall', 'metrics/top1_iou25_F1',
-                    'metrics/top1_center_in_gt_precision', 'metrics/top1_center_in_gt_recall',
-                    'metrics/top1_center_in_gt_F1',
+                    'metrics/F1_0.05', 'metrics/AP_0.05', 'metrics/precision_0.05', 'metrics/recall_0.05',
+                    'metrics/FA_per_image',
                     'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
                     'x/lr0', 'x/lr1', 'x/lr2']  # params
-            metrics_values = [
-                results[0],
-                results[1],
-                f1,
-                results[2],
-                results[3],
-                extra_metrics['top1_iou50_precision'],
-                extra_metrics['top1_iou50_recall'],
-                extra_metrics['top1_iou50_F1'],
-                extra_metrics['top1_iou25_precision'],
-                extra_metrics['top1_iou25_recall'],
-                extra_metrics['top1_iou25_F1'],
-                extra_metrics['top1_center_in_gt_precision'],
-                extra_metrics['top1_center_in_gt_recall'],
-                extra_metrics['top1_center_in_gt_F1'],
-                *results[4:],
-            ]
+            metrics_values = list(results)
             for x, tag in zip(list(mloss[:-1]) + metrics_values + lr, tags):
                 if tb_writer:
                     tb_writer.add_scalar(tag, x, epoch)  # tensorboard
                 if wandb_logger.wandb:
                     wandb_logger.log({tag: x})  # W&B
 
-            # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+            # Update best checkpoint score
+            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [F1@0.05, AP@0.05, ...]
             if fi > best_fitness:
                 best_fitness = fi
             wandb_logger.end_epoch(best_result=best_fitness == fi)

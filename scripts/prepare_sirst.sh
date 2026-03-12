@@ -127,14 +127,43 @@ for split in ("train", "val", "test"):
 
         lines = []
         mask = np.array(Image.open(mask_path).convert("L")) > 0
+        visited = np.zeros_like(mask, dtype=bool)
         ys, xs = np.where(mask)
-        if len(xs):
-            # Keep one detection per image by enclosing all positive pixels.
-            x0 = float(xs.min())
-            y0 = float(ys.min())
-            x1 = float(xs.max() + 1)
-            y1 = float(ys.max() + 1)
+        components = []
 
+        # The V1 masks preserve separate targets as disconnected foreground blobs.
+        # Convert each 8-connected component into its own YOLO box.
+        for y, x in zip(ys, xs):
+            if visited[y, x]:
+                continue
+
+            stack = [(int(y), int(x))]
+            visited[y, x] = True
+            comp_ys = []
+            comp_xs = []
+
+            while stack:
+                cy, cx = stack.pop()
+                comp_ys.append(cy)
+                comp_xs.append(cx)
+
+                for ny in range(max(0, cy - 1), min(mask.shape[0], cy + 2)):
+                    for nx in range(max(0, cx - 1), min(mask.shape[1], cx + 2)):
+                        if mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+
+            components.append(
+                (
+                    float(min(comp_xs)),
+                    float(min(comp_ys)),
+                    float(max(comp_xs) + 1),
+                    float(max(comp_ys) + 1),
+                )
+            )
+
+        components.sort(key=lambda box: (box[1], box[0], box[3], box[2]))
+        for x0, y0, x1, y1 in components:
             x_center = clamp(((x0 + x1) / 2.0) / w)
             y_center = clamp(((y0 + y1) / 2.0) / h)
             bw = clamp((x1 - x0) / w)

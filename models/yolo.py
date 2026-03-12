@@ -6,6 +6,7 @@ from copy import deepcopy
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 import torch
+from torchvision.ops import roi_align
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
@@ -204,6 +205,217 @@ class IDetect(nn.Module):
                                            dtype=torch.float32,
                                            device=z.device)
         box @= convert_matrix                          
+        return (box, score)
+
+
+class IOLNFADetect(nn.Module):
+    stride = None  # strides computed during build
+    export = False  # onnx export
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, nc=80, anchors=(), nfa_cfg=None, ch=()):  # detection layer
+        super(IOLNFADetect, self).__init__()
+        nfa_cfg = nfa_cfg or {}
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [torch.zeros(1)] * self.nl  # init grid
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)  # shape(nl,na,2)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+
+        self.ia = nn.ModuleList(ImplicitA(x) for x in ch)
+        self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
+        self.nfa_score_bias = float(nfa_cfg.get('score_bias', -2.0))
+        self.nfa_score_map = nn.ModuleList(
+            nn.Sequential(
+                Conv(x, x, 3, 1, act=nn.ReLU(inplace=True)),
+                nn.Conv2d(x, 1, kernel_size=3, stride=1, padding=1, bias=True),
+            )
+            for x in ch
+        )
+
+        self.roi_size = int(nfa_cfg.get('roi_size', 7))
+        self.sampling_ratio = int(nfa_cfg.get('sampling_ratio', 2))
+        self.objectness_mode = nfa_cfg.get('objectness_mode', 'olnfa')
+        self.blend_alpha = float(max(0.0, min(1.0, nfa_cfg.get('blend_alpha', 0.5))))
+        self.roi_chunk = int(nfa_cfg.get('roi_chunk', 4096))
+        self.eps = float(nfa_cfg.get('eps', 1e-6))
+        self.logit_eps = float(nfa_cfg.get('logit_eps', 1e-4))
+
+        for score_adapter in self.nfa_score_map:
+            nn.init.constant_(score_adapter[-1].bias, self.nfa_score_bias)
+
+    def forward(self, x):
+        return self._forward_impl(x, fused=False)
+
+    def fuseforward(self, x):
+        return self._forward_impl(x, fused=True)
+
+    def _forward_impl(self, x, fused=False):
+        z = []  # inference output
+        self.training |= self.export
+        features = list(x)
+        raw_preds = []
+
+        for i in range(self.nl):
+            feat = features[i]
+            pred = self.m[i](feat) if fused else self.im[i](self.m[i](self.ia[i](feat)))
+            bs, _, ny, nx = pred.shape
+            pred = pred.view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+            if self.grid[i].shape[2:4] != pred.shape[2:4]:
+                self.grid[i] = self._make_grid(nx, ny).to(pred.device)
+            raw_preds.append(pred)
+
+        num_tests = sum(pred.shape[1] * pred.shape[2] * pred.shape[3] for pred in raw_preds)
+        preds = [self._apply_objectness(features[i], pred, i, num_tests) for i, pred in enumerate(raw_preds)]
+
+        if not self.training:  # inference
+            for i, pred in enumerate(preds):
+                y = pred.sigmoid()
+                if not torch.onnx.is_in_onnx_export():
+                    xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = torch.cat((xy, wh, y[..., 4:]), dim=-1)
+                else:
+                    xy, wh, conf = y.split((2, 2, self.nc + 1), 4)
+                    xy = xy * (2. * self.stride[i]) + (self.stride[i] * (self.grid[i] - 0.5))
+                    wh = wh ** 2 * (4 * self.anchor_grid[i].data)
+                    y = torch.cat((xy, wh, conf), 4)
+                z.append(y.view(pred.shape[0], -1, self.no))
+
+        if self.training:
+            out = preds
+        elif self.end2end:
+            out = torch.cat(z, 1)
+        elif self.include_nms:
+            z = self.convert(z)
+            out = (z, )
+        elif self.concat:
+            out = torch.cat(z, 1)
+        else:
+            out = (torch.cat(z, 1), preds)
+
+        return out
+
+    def _apply_objectness(self, feature_map, pred, level_idx, num_tests):
+        if self.objectness_mode == 'baseline':
+            return pred
+        if self.objectness_mode not in ('olnfa', 'blend'):
+            raise ValueError(f'Unsupported objectness_mode={self.objectness_mode}')
+
+        nfa_prob = self._compute_nfa_objectness(feature_map, pred, level_idx, num_tests)
+        if self.objectness_mode == 'blend':
+            base_prob = pred[..., 4].sigmoid().float()
+            obj_prob = (1.0 - self.blend_alpha) * base_prob + self.blend_alpha * nfa_prob
+        else:
+            obj_prob = nfa_prob
+
+        obj_prob = obj_prob.float() * (1.0 - 2.0 * self.logit_eps) + self.logit_eps
+        obj_logit = torch.log(obj_prob) - torch.log1p(-obj_prob)
+        return torch.cat((pred[..., :4], obj_logit.to(pred.dtype).unsqueeze(-1), pred[..., 5:]), dim=-1)
+
+    def _compute_nfa_objectness(self, feature_map, pred, level_idx, num_tests):
+        pred_f = pred.float()
+        score_map = self._build_nfa_score_map(feature_map, level_idx)
+        boxes, batch_indices = self._decode_boxes(pred_f, level_idx)
+        stride = self._stride_value(level_idx)
+
+        rois = torch.cat((batch_indices[:, None].float(), boxes), dim=1)
+        roi_chunk = rois.shape[0] if self.roi_chunk <= 0 else self.roi_chunk
+        global_density = score_map.sigmoid().mean(dim=(1, 2, 3)).clamp(self.eps, 1.0 - self.eps)
+
+        objectness = []
+        for start in range(0, rois.shape[0], roi_chunk):
+            stop = start + roi_chunk
+            rois_chunk = rois[start:stop]
+            roi_features = roi_align(
+                score_map,
+                rois_chunk,
+                output_size=self.roi_size,
+                spatial_scale=1.0 / float(stride),
+                sampling_ratio=self.sampling_ratio,
+            )
+            kappa = roi_features.sigmoid().sum(dim=(1, 2, 3))
+            p = global_density[batch_indices[start:stop]]
+            objectness.append(self._nfa_activation(kappa, roi_features.shape[-2] * roi_features.shape[-1], p, num_tests))
+
+        bs, na, ny, nx, _ = pred.shape
+        return torch.cat(objectness, dim=0).view(bs, na, ny, nx)
+
+    def _build_nfa_score_map(self, feature_map, level_idx):
+        score_adapter = self.nfa_score_map[level_idx]
+        module_dtype = next(score_adapter.parameters()).dtype
+        score_map = score_adapter(feature_map.to(dtype=module_dtype))
+        return score_map.float()
+
+    def _decode_boxes(self, pred, level_idx):
+        bs, na, ny, nx, _ = pred.shape
+        grid = self.grid[level_idx].to(pred.device).type_as(pred)
+        anchor_grid = self.anchor_grid[level_idx].to(pred.device).type_as(pred)
+        stride = self._stride_value(level_idx)
+
+        xy = (pred[..., 0:2].sigmoid() * 2. - 0.5 + grid) * stride
+        wh = (pred[..., 2:4].sigmoid() * 2.) ** 2 * anchor_grid
+        boxes = torch.cat((xy - wh / 2.0, xy + wh / 2.0), dim=-1)
+
+        img_w = float(nx * stride)
+        img_h = float(ny * stride)
+        boxes_x = boxes[..., [0, 2]].clamp(0.0, img_w)
+        boxes_y = boxes[..., [1, 3]].clamp(0.0, img_h)
+        boxes = torch.stack((boxes_x[..., 0], boxes_y[..., 0], boxes_x[..., 1], boxes_y[..., 1]), dim=-1)
+        boxes = boxes.view(bs, -1, 4).contiguous()
+
+        batch_indices = torch.arange(bs, device=pred.device).view(bs, 1).repeat(1, na * ny * nx).view(-1)
+        return boxes.view(-1, 4), batch_indices
+
+    def _stride_value(self, level_idx):
+        if self.stride is None:
+            return 1.0
+        return float(self.stride[level_idx])
+
+    def _nfa_activation(self, kappa, nu, p, num_tests):
+        q = (kappa / float(nu)).clamp(self.eps, 1.0 - self.eps)
+        p = p.clamp(self.eps, 1.0 - self.eps)
+        log_eta = kappa.new_tensor(float(num_tests)).log()
+        kl = q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
+        significance = torch.where(q > p, float(nu) * kl - log_eta, -log_eta.expand_as(q))
+        return (2.0 * torch.sigmoid(significance + log_eta) - 1.0).clamp(0.0, 1.0)
+
+    def fuse(self):
+        print("IOLNFADetect.fuse")
+        # fuse ImplicitA and Convolution
+        for i in range(len(self.m)):
+            c1, c2, _, _ = self.m[i].weight.shape
+            c1_, c2_, _, _ = self.ia[i].implicit.shape
+            self.m[i].bias += torch.matmul(self.m[i].weight.reshape(c1, c2),
+                                           self.ia[i].implicit.reshape(c2_, c1_)).squeeze(1)
+
+        # fuse ImplicitM and Convolution
+        for i in range(len(self.m)):
+            c1, c2, _, _ = self.im[i].implicit.shape
+            self.m[i].bias *= self.im[i].implicit.reshape(c2)
+            self.m[i].weight *= self.im[i].implicit.transpose(0, 1)
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing='ij')
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+    def convert(self, z):
+        z = torch.cat(z, 1)
+        box = z[:, :, :4]
+        conf = z[:, :, 4:5]
+        score = z[:, :, 5:]
+        score *= conf
+        convert_matrix = torch.tensor([[1, 0, 1, 0], [0, 1, 0, 1], [-0.5, 0, 0.5, 0], [0, -0.5, 0, 0.5]],
+                                      dtype=torch.float32,
+                                      device=z.device)
+        box @= convert_matrix
         return (box, score)
 
 
@@ -547,6 +759,14 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
+        if isinstance(m, IOLNFADetect):
+            s = 256  # 2x min stride
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            check_anchor_order(m)
+            m.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            self._initialize_biases()  # only run once
+            # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IAuxDetect):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
@@ -608,11 +828,11 @@ class Model(nn.Module):
                 self.traced=False
 
             if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IOLNFADetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
                     break
 
             if profile:
-                c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
+                c = isinstance(m, (Detect, IDetect, IOLNFADetect, IAuxDetect, IBin))
                 o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
                 for _ in range(10):
                     m(x.copy() if c else x)
@@ -703,7 +923,7 @@ class Model(nn.Module):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                 delattr(m, 'bn')  # remove batchnorm
                 m.forward = m.fuseforward  # update forward
-            elif isinstance(m, (IDetect, IAuxDetect)):
+            elif isinstance(m, (IDetect, IOLNFADetect, IAuxDetect)):
                 m.fuse()
                 m.forward = m.fuseforward
         self.info()
@@ -787,7 +1007,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f[0]]
         elif m is Foldcut:
             c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
+        elif m in [Detect, IDetect, IOLNFADetect, IAuxDetect, IBin, IKeypoint]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
