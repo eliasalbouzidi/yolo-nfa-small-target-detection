@@ -234,7 +234,8 @@ class IOLNFADetect(nn.Module):
         self.nfa_score_map = nn.ModuleList(
             nn.Sequential(
                 Conv(x, x, 3, 1, act=nn.ReLU(inplace=True)),
-                nn.Conv2d(x, 1, kernel_size=3, stride=1, padding=1, bias=True),
+                Conv(x, x, 3, 1, act=nn.ReLU(inplace=True)),
+                nn.Conv2d(x, 1, kernel_size=1, stride=1, padding=0, bias=True),
             )
             for x in ch
         )
@@ -243,6 +244,7 @@ class IOLNFADetect(nn.Module):
         self.sampling_ratio = int(nfa_cfg.get('sampling_ratio', 2))
         self.objectness_mode = nfa_cfg.get('objectness_mode', 'olnfa')
         self.blend_alpha = float(max(0.0, min(1.0, nfa_cfg.get('blend_alpha', 0.5))))
+        self.active_blend_alpha = self._target_blend_alpha()
         self.roi_chunk = int(nfa_cfg.get('roi_chunk', 4096))
         self.eps = float(nfa_cfg.get('eps', 1e-6))
         self.logit_eps = float(nfa_cfg.get('logit_eps', 1e-4))
@@ -309,11 +311,14 @@ class IOLNFADetect(nn.Module):
             raise ValueError(f'Unsupported objectness_mode={self.objectness_mode}')
 
         nfa_prob = self._compute_nfa_objectness(feature_map, pred, level_idx, num_tests)
-        if self.objectness_mode == 'blend':
-            base_prob = pred[..., 4].sigmoid().float()
-            obj_prob = (1.0 - self.blend_alpha) * base_prob + self.blend_alpha * nfa_prob
-        else:
+        alpha = float(max(0.0, min(1.0, self.active_blend_alpha)))
+        if alpha <= 0.0:
+            return pred
+        if alpha >= 1.0:
             obj_prob = nfa_prob
+        else:
+            base_prob = pred[..., 4].sigmoid().float()
+            obj_prob = (1.0 - alpha) * base_prob + alpha * nfa_prob
 
         obj_prob = obj_prob.float() * (1.0 - 2.0 * self.logit_eps) + self.logit_eps
         obj_logit = torch.log(obj_prob) - torch.log1p(-obj_prob)
@@ -324,6 +329,10 @@ class IOLNFADetect(nn.Module):
         score_map = self._build_nfa_score_map(feature_map, level_idx)
         boxes, batch_indices = self._decode_boxes(pred_f, level_idx)
         stride = self._stride_value(level_idx)
+        boxes_fm = boxes / float(stride)
+        box_wh = (boxes_fm[:, 2:4] - boxes_fm[:, 0:2]).clamp_min(0.0)
+        # Use the candidate box support in feature-map coordinates for nu.
+        box_area = (box_wh[:, 0] * box_wh[:, 1]).clamp_min(1.0)
 
         rois = torch.cat((batch_indices[:, None].float(), boxes), dim=1)
         roi_chunk = rois.shape[0] if self.roi_chunk <= 0 else self.roi_chunk
@@ -342,7 +351,9 @@ class IOLNFADetect(nn.Module):
             )
             kappa = roi_features.sigmoid().sum(dim=(1, 2, 3))
             p = global_density[batch_indices[start:stop]]
-            objectness.append(self._nfa_activation(kappa, roi_features.shape[-2] * roi_features.shape[-1], p, num_tests))
+            roi_sample_count = roi_features.shape[-2] * roi_features.shape[-1]
+            nu = box_area[start:stop]
+            objectness.append(self._nfa_activation(kappa, roi_sample_count, nu, p, num_tests))
 
         bs, na, ny, nx, _ = pred.shape
         return torch.cat(objectness, dim=0).view(bs, na, ny, nx)
@@ -378,13 +389,26 @@ class IOLNFADetect(nn.Module):
             return 1.0
         return float(self.stride[level_idx])
 
-    def _nfa_activation(self, kappa, nu, p, num_tests):
-        q = (kappa / float(nu)).clamp(self.eps, 1.0 - self.eps)
+    def _nfa_activation(self, kappa, roi_sample_count, nu, p, num_tests):
+        q = (kappa / float(roi_sample_count)).clamp(self.eps, 1.0 - self.eps)
+        nu = nu.clamp_min(1.0)
         p = p.clamp(self.eps, 1.0 - self.eps)
         log_eta = kappa.new_tensor(float(num_tests)).log()
         kl = q * torch.log(q / p) + (1.0 - q) * torch.log((1.0 - q) / (1.0 - p))
-        significance = torch.where(q > p, float(nu) * kl - log_eta, -log_eta.expand_as(q))
+        significance = torch.where(q > p, nu * kl - log_eta, -log_eta.expand_as(q))
         return (2.0 * torch.sigmoid(significance + log_eta) - 1.0).clamp(0.0, 1.0)
+
+    def _target_blend_alpha(self):
+        if self.objectness_mode == 'baseline':
+            return 0.0
+        if self.objectness_mode == 'blend':
+            return self.blend_alpha
+        if self.objectness_mode == 'olnfa':
+            return 1.0
+        raise ValueError(f'Unsupported objectness_mode={self.objectness_mode}')
+
+    def set_schedule_alpha(self, alpha):
+        self.active_blend_alpha = float(max(0.0, min(1.0, alpha)))
 
     def fuse(self):
         print("IOLNFADetect.fuse")
@@ -948,6 +972,11 @@ class Model(nn.Module):
         m = autoShape(self)  # wrap model
         copy_attr(m, self, include=('yaml', 'nc', 'hyp', 'names', 'stride'), exclude=())  # copy attributes
         return m
+
+    def set_nfa_schedule_alpha(self, alpha):
+        for module in self.modules():
+            if isinstance(module, IOLNFADetect):
+                module.set_schedule_alpha(alpha)
 
     def info(self, verbose=False, img_size=640):  # print model information
         model_info(self, verbose, img_size)
