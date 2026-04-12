@@ -1,0 +1,12 @@
+# SIRST dataset (prepared with scripts/prepare_sirst.sh)
+
+
+train: ./datasets/sirst/images/train
+val: ./datasets/sirst/images/val
+test: ./datasets/sirst/images/test
+
+# number of classes
+nc: 1
+
+# class names
+names: ['target']

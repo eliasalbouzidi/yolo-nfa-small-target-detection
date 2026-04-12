@@ -1,0 +1,7 @@
+# SIRST few-shot split (15-shot, fold 3) derived from the standard train split.
+train: datasets/sirst/images/fs15_fold3
+val: datasets/sirst/images/val
+test: datasets/sirst/images/test
+
+nc: 1
+names: ['target']
